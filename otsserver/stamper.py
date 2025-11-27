@@ -26,6 +26,9 @@ from opentimestamps.core.timestamp import Timestamp, make_merkle_tree
 
 from otsserver.calendar import Journal
 
+# https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp
+DUST = 330
+
 KnownBlock = collections.namedtuple('KnownBlock', ['height', 'hash'])
 TimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'commitment_timestamps'])
 UnconfirmedTimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'n'])
@@ -177,8 +180,6 @@ def listunspent(proxy, minconf=0, maxconf=999999):
 
 def find_unspent(proxy):
     def sort_filter_unspent(unspent):
-        # https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp
-        DUST = 546
         return sorted(filter(lambda x: x['amount'] > DUST and x['spendable'], unspent),
                       key=lambda x: x['amount'])
 
