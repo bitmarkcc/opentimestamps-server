@@ -180,8 +180,8 @@ def listunspent(proxy, minconf=0, maxconf=999999):
 
 def find_unspent(proxy):
     def sort_filter_unspent(unspent):
-        return sorted(filter(lambda x: x['amount'] > DUST and x['spendable'], unspent),
-                      key=lambda x: x['amount'])
+        return list(reversed(sorted(filter(lambda x: x['amount'] > DUST and x['spendable'], unspent),
+                      key=lambda x: x['amount'])))
 
     unspent = sort_filter_unspent(listunspent(proxy, 1))
 
@@ -252,12 +252,15 @@ class Stamper:
 
         old_change_txout = old_tx.vout[0]
 
-        assert old_change_txout.nValue - delta_fee > relay_feerate * 3  # FIXME: handle running out of money!
-
-        return CTransaction(old_tx.vin,
-                            [CTxOut(old_change_txout.nValue - delta_fee, old_change_txout.scriptPubKey),
-                             CTxOut(0, CScript([OP_RETURN, new_commitment]))],
-                            nLockTime=new_min_block_height)
+        if old_change_txout.nValue - delta_fee > DUST:
+            return CTransaction(old_tx.vin,
+                                [CTxOut(old_change_txout.nValue - delta_fee, old_change_txout.scriptPubKey),
+                                 CTxOut(0, CScript([OP_RETURN, new_commitment]))],
+                                nLockTime=new_min_block_height)
+        else:
+            return CTransaction(old_tx.vin,
+                                [CTxOut(0, CScript([OP_RETURN, new_commitment]))],
+                                nLockTime=new_min_block_height)
 
     def __save_confirmed_timestamp_tx(self, confirmed_tx):
         """Save a fully confirmed timestamp to disk"""
