@@ -222,7 +222,7 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
             # tx has been made to combine dust UTXOs.
             wallet_balance = proxy.getbalance(minconf=1)
 
-            transactions = proxy._call("listtransactions", "", 1000)
+            transactions = proxy._call("listtransactions", "*", 1000)
             # We want only the confirmed txs containing an OP_RETURN, from most to least recent
             transactions = list(filter(lambda x: x["confirmations"] > 0 and x["amount"] == 0, transactions))
             for tx in transactions:
