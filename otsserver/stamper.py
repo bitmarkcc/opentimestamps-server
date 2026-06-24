@@ -27,6 +27,9 @@ from opentimestamps.core.timestamp import Timestamp, make_merkle_tree
 from otsserver.calendar import Journal
 from otsserver import coin_conf_file
 
+# https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp
+DUST = 330
+
 KnownBlock = collections.namedtuple('KnownBlock', ['height', 'hash'])
 TimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'commitment_timestamps'])
 UnconfirmedTimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'n'])
@@ -43,7 +46,7 @@ def make_btc_block_merkle_tree(blk_txids):
             digests.append(digests[-1].msg)
 
         next_level = []
-        for i in range(0,len(digests), 2):
+        for i in range(0, len(digests), 2):
             next_level.append(cat_sha256d(digests[i], digests[i + 1]))
 
         digests = next_level
@@ -164,11 +167,10 @@ def _get_tx_fee(tx, proxy):
 
 def find_unspent(proxy):
     def sort_filter_unspent(unspent):
-        DUST = 0.001 * COIN
-        return sorted(filter(lambda x: x['amount'] > DUST and x['spendable'], unspent),
-                      key=lambda x: x['amount'])
+        return list(reversed(sorted(filter(lambda x: x['amount'] > DUST and x['spendable'], unspent),
+                      key=lambda x: x['amount'])))
 
-    unspent = sort_filter_unspent(proxy.listunspent(1))
+    unspent = sort_filter_unspent(listunspent(proxy, 1))
 
     if len(unspent):
         return unspent
@@ -176,25 +178,33 @@ def find_unspent(proxy):
     else:
         logging.info("Couldn't find a confirmed output, trying unconfirmed")
 
-        # Try again with the unconfirmed transactions
-        unconfirmed_unspent = sort_filter_unspent(proxy.listunspent(0, 1))
+        # Try again with the unconfirmed transactions to find a prior
+        # unconfirmed timestamp transaction that we can safely replace.
+        unconfirmed_unspent = sort_filter_unspent(listunspent(proxy, 0, 1))
 
         confirmed_unspent = []
         for unspent_txout in unconfirmed_unspent:
             txid = unspent_txout['outpoint'].hash
             tx = proxy.getrawtransaction(txid)
-            for txin in tx.vin:
+
+            # Unconfirmed timestamp transactions should all have a single input
+            # and two outputs.
+            #
+            # FIXME: we should check that the second output is an op_return
+            if len(tx.vin) == 1 and len(tx.vout) == 2:
+                txin = tx.vin[0]
                 try:
+                    # Check that this output is in the UTXO set, and is thus
+                    # confirmed.
                     confirmed_outpoint = proxy.gettxout(txin.prevout, includemempool=False)
 
-                    # make sure this txout is from a wallet transaction, which
-                    # means we can spend it
+                    # Make sure this txout is from a wallet transaction, which
+                    # means we created it, and can spend it safely without any
+                    # risk of a double-spend.
+                    #
+                    # This is probably overkill as a third party would have a
+                    # hard time double spending a confirmed transaction too.
                     proxy.gettransaction(txin.prevout.hash)
-
-                    # All our txs will have a single input, with opt-in RBF set
-                    prevout_tx = proxy.getrawtransaction(txin.prevout.hash)
-                    if len(prevout_tx.vin) != 1 or prevout_tx.vin[0].nSequence != 0xfffffffd:
-                        continue
                 except IndexError:
                     continue
 
@@ -212,15 +222,11 @@ class Stamper:
         """Create a new timestamp transaction template
 
         The transaction created will have one input and two outputs, with the
-        timestamp output set to an invalid dummy.
-
-        The fee is set to zero, but nSequence is set to opt-in to transaction
-        replacement, so you can find an appropriate fee iteratively.
+        timestamp output set to an dummy OP_RETURN with an invalid amount.
         """
-
-        return CTransaction([CTxIn(outpoint, nSequence=0xfffffffd)],
+        return CTransaction([CTxIn(outpoint, nSequence=0xfffffffe)],
                             [CTxOut(txout_value, change_scriptPubKey),
-                             CTxOut(-1, CScript())])
+                             CTxOut(-1, CScript([OP_RETURN, b'\x00' * 32]))])
 
     @staticmethod
     def __update_timestamp_tx(old_tx, new_commitment, new_min_block_height, relay_feerate):
@@ -229,16 +235,20 @@ class Stamper:
         Returns the old transaction with a new commitment, and with the fee
         bumped appropriately.
         """
-        delta_fee = int(len(old_tx.serialize()) * relay_feerate)
+
+        delta_fee = int((old_tx.calc_weight() + 3)/4 * relay_feerate)
 
         old_change_txout = old_tx.vout[0]
 
-        assert old_change_txout.nValue - delta_fee > relay_feerate * 3  # FIXME: handle running out of money!
-
-        return CTransaction(old_tx.vin,
-                            [CTxOut(old_change_txout.nValue - delta_fee, old_change_txout.scriptPubKey),
-                             CTxOut(0, CScript([OP_RETURN, new_commitment]))],
-                            nLockTime=new_min_block_height)
+        if old_change_txout.nValue - delta_fee > DUST:
+            return CTransaction(old_tx.vin,
+                                [CTxOut(old_change_txout.nValue - delta_fee, old_change_txout.scriptPubKey),
+                                 CTxOut(0, CScript([OP_RETURN, new_commitment]))],
+                                nLockTime=new_min_block_height)
+        else:
+            return CTransaction(old_tx.vin,
+                                [CTxOut(0, CScript([OP_RETURN, new_commitment]))],
+                                nLockTime=new_min_block_height)
 
     def __save_confirmed_timestamp_tx(self, confirmed_tx):
         """Save a fully confirmed timestamp to disk"""
@@ -274,9 +284,11 @@ class Stamper:
 
         new_blocks = self.known_blocks.update_from_proxy(proxy)
 
-        # code after this if it's executed only when we have new blocks, it simplify reasoning at the cost of not
-        # having a broadcasted tx immediately after we have a new cycle (the calendar wait the next block)
-        if not new_blocks:
+        # If we don't have any new blocks, and we have any unconfirmed
+        # transactions, wait for a new block because there is nothing useful we
+        # can do as the unconfirmed txs haven't been given a chance to get
+        # mined.
+        if not new_blocks and len(self.unconfirmed_txs) > 0:
             return
 
         for (block_height, block_hash) in new_blocks:
@@ -314,12 +326,17 @@ class Stamper:
                     time.sleep(5)
                     proxy = bitcoin.rpc.Proxy(btc_conf_file=coin_conf_file)
 
-            # the following is an optimization, by pre computing the tx_id we rapidly check if our unconfirmed tx
-            # is in the block
+            # Pre-compute the block txids once, rather than recalculating them
+            # for each unconfirmed_tx
             block_txids = set(tx.GetTxid() for tx in block.vtx)
 
             # Check all potential pending txs against this block.
-            # iterating in reverse order to prioritize most recent digest which commits to a bigger merkle tree
+            #
+            # We iterate in reverse order to prioritize the most recent digest,
+            # which would commit to the biggest merkle tree. However, at the
+            # moment this doesn't actually matter, as we are only checking
+            # transactions we created, which always conflict with each other
+            # due to RBF.
             for unconfirmed_tx in self.unconfirmed_txs[::-1]:
 
                 if unconfirmed_tx.tx.GetTxid() not in block_txids:
@@ -337,9 +354,9 @@ class Stamper:
 
                 mined_tx.tip_timestamp.merge(block_timestamp)
 
+                logging.debug("Removing %d commitments from pending" % (unconfirmed_tx.n))
                 for commitment in tuple(self.pending_commitments)[0:unconfirmed_tx.n]:
                     self.pending_commitments.remove(commitment)
-                    logging.debug("Removed commitment %s from pending" % b2x(commitment))
 
                 assert self.min_confirmations > 1
                 logging.info("Success! %d commitments timestamped, now waiting for %d more confirmations" %
@@ -352,13 +369,19 @@ class Stamper:
                 # Erase all unconfirmed txs, as they all conflict with each other
                 self.unconfirmed_txs.clear()
 
-                # And finally, we can reset the last time a timestamp
-                # transaction was mined to right now.
-                self.last_timestamp_tx = time.time()
+                # Finally, schedule a new timestamp transaction.
+                #
+                # To help desync calendars, this time is randomized.
+                self.next_timestamp_tx = time.time() + (self.min_tx_interval * random.uniform(1, 2))
 
                 break
 
-        time_to_next_tx = int(self.last_timestamp_tx + self.min_tx_interval - time.time())
+        # We've finished dealing with the new block(s) and any transactions
+        # that have confirmed. Now we handling sending new transactions, be it
+        # the first transaction of a fee-bumping cycle. Or replacing previously
+        # sent transactions.
+
+        time_to_next_tx = self.next_timestamp_tx - time.time()
         if time_to_next_tx > 0:
             # Minimum interval between transactions hasn't been reached, so do nothing
             logging.debug("Waiting %ds before next tx" % time_to_next_tx)
@@ -368,9 +391,14 @@ class Stamper:
             logging.debug("No pending commitments, no tx needed")
             return
 
+        new_tx = False
         if self.unconfirmed_txs:
+            bump_feerate = self.relay_feerate
             (prev_tx, prev_tip_timestamp, prev_commitment_timestamps) = self.unconfirmed_txs[-1]
-        else:  # first tx of a new cycle
+
+        # First transaction of a new cycle
+        else:
+            new_tx = True
             # Find the biggest unspent output that's confirmed
             unspent = find_unspent(proxy)
 
@@ -378,12 +406,33 @@ class Stamper:
                 logging.error("Can't timestamp; no spendable outputs")
                 return
 
-            change_addr = proxy.getnewaddress()
-            prev_tx = self.__create_new_timestamp_tx_template(unspent[-1]['outpoint'], unspent[-1]['amount'],
-                                                              change_addr.to_scriptPubKey())
+            change_addr = proxy._call("getnewaddress", "", "bech32")
+            change_addr_info = proxy._call("getaddressinfo", change_addr)
+            change_addr_script = x(change_addr_info['scriptPubKey'])
+
+            unsigned_tx = self.__create_new_timestamp_tx_template(unspent[-1]['outpoint'], unspent[-1]['amount'],
+                                                                  change_addr_script)
+
+            # Sign the initial tx template so that fee estimation knows how big
+            # it is, including the size of the signature.
+            r = proxy.signrawtransactionwithwallet(unsigned_tx)
+            if not r['complete']:
+                logging.error("Failed to sign transaction! r = %r" % r)
+                return
+            prev_tx = r['tx']
 
             logging.debug('New timestamp tx, spending output %r, value %s' % (unspent[-1]['outpoint'],
                                                                               str_money_value(unspent[-1]['amount'])))
+
+            # For the first transaction, use an estimated fee with confirmation
+            # target as the bump_feerate. It'll get reset later.
+            initial_feerate = proxy._call("estimatesmartfee", self.conf_target)
+            try:
+                initial_feerate = float(initial_feerate['feerate']) * COIN / 1000
+            except KeyError:
+                initial_feerate = self.relay_feerate
+
+            bump_feerate = initial_feerate
 
         (tip_timestamp, commitment_timestamps) = self.__pending_to_merkle_tree(len(self.pending_commitments))
         logging.debug("New tip is %s" % b2x(tip_timestamp.msg))
@@ -392,10 +441,14 @@ class Stamper:
         proxy = bitcoin.rpc.Proxy(btc_conf_file=coin_conf_file)
 
         sent_tx = None
-        relay_feerate = self.relay_feerate
         while sent_tx is None:
             unsigned_tx = self.__update_timestamp_tx(prev_tx, tip_timestamp.msg,
-                                                     proxy.getblockcount(), relay_feerate)
+                                                     proxy.getblockcount(), bump_feerate)
+
+            # Reset now that the initial tx template has been processed.
+            if new_tx:
+                new_tx = False
+                bump_feerate = self.relay_feerate
 
             fee = _get_tx_fee(unsigned_tx, proxy)
             if fee is None:
@@ -405,7 +458,7 @@ class Stamper:
                 logging.error("Maximum txfee reached!")
                 return
 
-            r = proxy.signrawtransaction(unsigned_tx)
+            r = proxy.signrawtransactionwithwallet(unsigned_tx)
             if not r['complete']:
                 logging.error("Failed to sign transaction! r = %r" % r)
                 return
@@ -418,7 +471,7 @@ class Stamper:
                     logging.debug("Err: %r" % err.error)
                     # Insufficient priority - basically means we didn't
                     # pay enough, so try again with a higher feerate
-                    relay_feerate *= 2
+                    bump_feerate *= 1.25
                     continue
 
                 else:
@@ -458,16 +511,30 @@ class Stamper:
                 # Is this commitment already stamped?
                 if commitment not in self.calendar:
                     self.pending_commitments.add(commitment)
-                    logging.debug('Added %s (idx %d) to pending commitments; %d total'
-                                  % (b2x(commitment), idx, len(self.pending_commitments)))
+                    if idx % 1000 == 0:
+                        logging.debug('Added %s (idx %d) to pending commitments; %d total'
+                                      % (b2x(commitment), idx, len(self.pending_commitments)))
                 else:
                     if idx % 1000 == 0:
                         logging.debug('Commitment at idx %d already stamped' % idx)
 
                 idx += 1
 
+            self.journal_cursor = idx
+
             try:
                 self.__do_bitcoin()
+            except bitcoin.rpc.InWarmupError as warmuperr:
+                logging.info("Bitcoincore is warming up: %r" % warmuperr)
+                time.sleep(5)
+            except ValueError as err:
+                # If not caused by misconfiguration this error in bitcoinlib
+                # usually occurs when bitcoincore is not started
+                if str(err).startswith('Cookie file unusable'):
+                    logging.error("Proxy Authentication Error: Is bitcoincore running?: %r" % err)
+                    time.sleep(5)
+                else:
+                    logging.error("__do_bitcoin() failed: %r" % exp, exc_info=True)
             except Exception as exp:
                 # !@#$ Python.
                 #
@@ -492,19 +559,31 @@ class Stamper:
             return "Pending confirmation in Bitmark blockchain"
 
         else:
+            journal = Journal(self.calendar.path + '/journal')
+            idx = self.journal_cursor
+            while idx is not None:
+                # cursor is None when stamper loop never executed once
+                try:
+                    recent_commitment = journal[idx]
+                except KeyError:
+                    break
+                if recent_commitment == commitment:
+                    return "Pending confirmation in Bitcoin blockchain"
+                idx += 1
+
             for height, ttx in self.txs_waiting_for_confirmation.items():
                for commitment_timestamp in ttx.commitment_timestamps:
                     if commitment == commitment_timestamp.msg:
                         return "Timestamped by transaction %s; waiting for %d confirmations"\
-                               % (b2lx(ttx.tx.GetTxid()), self.min_confirmations-1)
+                               % (b2lx(ttx.tx.GetTxid()), self.min_confirmations)
 
-            else:
-                return False
+        return False
 
-    def __init__(self, calendar, exit_event, relay_feerate, min_confirmations, min_tx_interval, max_fee, max_pending):
+    def __init__(self, calendar, exit_event, conf_target, relay_feerate, min_confirmations, min_tx_interval, max_fee, max_pending):
         self.calendar = calendar
         self.exit_event = exit_event
 
+        self.conf_target = conf_target
         self.relay_feerate = relay_feerate
         self.min_confirmations = min_confirmations
         assert self.min_confirmations > 1
@@ -518,7 +597,8 @@ class Stamper:
         self.pending_commitments = OrderedSet()
         self.txs_waiting_for_confirmation = {}
 
-        self.last_timestamp_tx = 0
+        self.next_timestamp_tx = time.time()
+        self.journal_cursor = None
 
         self.thread = threading.Thread(target=self.__loop)
         self.thread.start()

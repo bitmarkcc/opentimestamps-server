@@ -66,7 +66,7 @@ class Backup:
                 # according to https://docs.python.org/3/library/exceptions.html#IndexError IndexError is the more
                 # appropriate exception for this case
                 raise IndexError
-            if i % 100 == 0:
+            if i % 1000 == 0:
                 logging.debug("Got commitment " + str(i) + ":" + b2x(self.journal[i]))
 
         logging.debug("map len " + str(len(backup_map)) + " start:" + str(start) + " end:" + str(end))
@@ -146,7 +146,7 @@ class Backup:
         temp_file.close()
         os.rename(temp_file.name, cache_file)  # rename is atomic
 
-# The following is a shrinked version of the standard calendar http server, it only support the '/timestamp' endpoint
+# The following is a shrunk version of the standard calendar http server, it only support the '/timestamp' endpoint
 # This way the backup server could serve request in place of the calendar serve which is backupping
 class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
 
@@ -293,11 +293,18 @@ class AskBackup(threading.Thread):
             logging.debug("Total attestations: " + str(len(attestations)))
             for key, attestation in attestations.items():
                 if attestation.__class__ == BitcoinBlockHeaderAttestation:
-                    blockhash = proxy.getblockhash(attestation.height)
-                    block_header = proxy.getblockheader(blockhash)
-                    # the following raise an exception and block computation if the attestation does not verify
-                    attested_time = attestation.verify_against_blockheader(key, block_header)
-                    logging.debug("Verifying " + b2x(key) + " result " + str(attested_time))
+                    while True:
+                        try:
+                            blockhash = proxy.getblockhash(attestation.height)
+                            block_header = proxy.getblockheader(blockhash)
+                            # the following raise an exception and block computation if the attestation does not verify
+                            attested_time = attestation.verify_against_blockheader(key, block_header)
+                            logging.debug("Verifying " + b2x(key) + " result " + str(attested_time))
+                            break
+                        except Exception as err:
+                            logging.info("%s - error contacting bitcoin node, sleeping..." % (err))
+                            time.sleep(SLEEP_SECS)
+                            proxy = bitcoin.rpc.Proxy()
 
             # verify all ops connects to an attestation
             logging.debug("Total ops: " + str(len(ops)))
@@ -328,8 +335,3 @@ class AskBackup(threading.Thread):
 
             elapsed_time = time.time() - start_time
             logging.info("Took %ds for %s" % (elapsed_time, str(backup_url)))
-
-
-
-
-

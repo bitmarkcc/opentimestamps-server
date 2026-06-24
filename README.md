@@ -11,10 +11,10 @@ mode.
 
 ## Installation
 
-You'll need a local Bitmark node with a wallet with some funds in it; a pruned
-node is fine. While `otsd` is running the wallet should not be used for other
-purposes, as currently the Bitmark timestamping functionality assumes that it
-has exclusive use of the wallet.
+You'll need a local Bitmark node with a wallet
+with some funds in it; a pruned node is fine. While `otsd` is running the
+wallet should not be used for other purposes, as currently the Bitmark
+timestamping functionality assumes that it has exclusive use of the wallet.
 
 Install the requirements:
 
@@ -26,6 +26,7 @@ Create the calendar:
 ```
 mkdir -p ~/.otsd/calendar/
 echo "http://127.0.0.1:14788" > ~/.otsd/calendar/uri
+echo "bitcoin donation address" > ~/.otsd/calendar/donation_addr
 dd if=/dev/random of=~/.otsd/calendar/hmac-key bs=32 count=1
 ```
 
@@ -34,7 +35,11 @@ returned by this calendar server. For a server used for testing, the above is
 fine; for production usage the URI should be set to a stable URL that
 OpenTimestamps clients will be able to access indefinitely.
 
-The HMAC key should be kept secret; it's meant to allow for last-ditch calendar
+The donation address needs to be a valid Bitcoin address for the type of
+network (mainnet, testnet, regtest) you're running otsd on. It's displayed on
+the calendar info page.
+
+The HMAC key should be kept secret. It's meant to allow for last-ditch calendar
 recovery from untrusted sources, although only part of the functionality is
 implemented. See the source code for more details!
 
@@ -67,15 +72,15 @@ Tip: with regtest you can mine blocks on demand to make your timestamp confirm
 with the `generate` RPC command. For example, to mine ten blocks instantly:
 
 ```
-bitmark-cli generate 10
+bitmark-cli -generate 10
 ```
 
-By default `otsd` binds to localhost, and isn't really designed to be exposed
-directly to the public. For production usage we recommend using a reverse
-proxy; an example configuration for nginx is provided under the
-`contrib/nginx` directory of this repo.
-
+By default `otsd` binds to localhost; `otsd` is not designed to be exposed
+directly to the public and requires a reverse proxy for production usage. An
+example configuration for nginx is provided under `contrib/nginx`.
 
 ## Unit tests
 
+```
 python3 -m unittest discover -v
+```

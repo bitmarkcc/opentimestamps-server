@@ -12,7 +12,7 @@
 from bitcoin.core import CoreChainParams
 import os.path
 
-__version__ = "0.3.0"
+__version__ = "0.7.1"
 
 class BitmarkMainParams(CoreChainParams):
     NAME = "bitmarkmainnet"
