@@ -420,7 +420,7 @@ class Stamper:
                 logging.error("Can't timestamp; no spendable outputs")
                 return
 
-            change_addr = proxy._call("getnewaddress", "", "bech32")
+            change_addr = proxy._call("getnewaddress", "", "legacy")
             change_addr_info = proxy._call("getaddressinfo", change_addr)
             change_addr_script = x(change_addr_info['scriptPubKey'])
 
