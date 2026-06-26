@@ -16,7 +16,7 @@ import time
 import sys
 import bitcoin.rpc
 
-from bitcoin.core import COIN, b2lx, b2x, CTxIn, CTxOut, CTransaction, str_money_value
+from bitcoin.core import COIN, b2lx, b2x, x, lx, CTxIn, CTxOut, COutPoint, CTransaction, str_money_value
 from bitcoin.core.script import CScript, OP_RETURN
 
 from opentimestamps.bitcoin import cat_sha256d
@@ -164,6 +164,20 @@ def _get_tx_fee(tx, proxy):
 
     value_out = sum(txout.nValue for txout in tx.vout)
     return value_in - value_out
+
+# not using proxy.listunspent() because it tries to convert bech32 address as base58
+def listunspent(proxy, minconf=0, maxconf=999999):
+    r = proxy._call('listunspent', minconf, maxconf)
+
+    r2 = []
+    for unspent in r:
+        unspent['outpoint'] = COutPoint(lx(unspent['txid']), unspent['vout'])
+        del unspent['txid']
+        del unspent['vout']
+        unspent['scriptPubKey'] = CScript(x(unspent['scriptPubKey']))
+        unspent['amount'] = int(unspent['amount'] * COIN)
+        r2.append(unspent)
+    return r2
 
 def find_unspent(proxy):
     def sort_filter_unspent(unspent):
